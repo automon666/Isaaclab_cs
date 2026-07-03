@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<package>
+  <name>EVA02_description</name>
+  <version>1.0.0</version>
+  <description>EVA02 quadruped robot description</description>
+</package>

@@ -244,11 +244,11 @@ class CTS:
 
                 # Policy forward pass
                 action_dist = self.actor.get_distribution({"policy": policy_input})
-                log_probs = action_dist.log_prob(actions)
-                entropy = action_dist.entropy().mean()
+                log_probs = action_dist.log_prob(actions).sum(dim=-1)
+                entropy = action_dist.entropy().sum(dim=-1).mean()
 
                 # Value forward pass
-                values = self.critic(obs, z_privileged)
+                values = self.critic({"policy": z_privileged})
 
                 # PPO policy loss
                 ratio = torch.exp(log_probs - old_log_probs)

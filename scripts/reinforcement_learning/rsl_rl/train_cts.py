@@ -50,6 +50,14 @@ import os
 import torch
 from datetime import datetime
 
+# Set ROS_PACKAGE_PATH for URDF mesh resolution
+import os as _os
+_os.environ.setdefault("ROS_PACKAGE_PATH", "")
+_ros_paths = ["/home/tino66/Isaaclab_cs/assets"]
+if _os.environ["ROS_PACKAGE_PATH"]:
+    _ros_paths.append(_os.environ["ROS_PACKAGE_PATH"])
+_os.environ["ROS_PACKAGE_PATH"] = ":".join(_ros_paths)
+
 from isaaclab.envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
@@ -76,8 +84,22 @@ def main():
     # Note: You need to ensure your environment provides both privileged and proprioceptive observations
     print(f"[INFO] Creating environment: {args_cli.task}")
 
-    # Create environment
-    env = gym.make(args_cli.task, render_mode="rgb_array" if args_cli.video else None)
+    # Get environment configuration from gym registry
+    env_spec = gym.spec(args_cli.task)
+    env_cfg_entry_point = env_spec.kwargs.get("env_cfg_entry_point")
+
+    if env_cfg_entry_point is None:
+        raise ValueError(f"Task {args_cli.task} does not have env_cfg_entry_point in gym registry")
+
+    # Instantiate environment configuration
+    env_cfg = env_cfg_entry_point()
+
+    # Override number of environments
+    if args_cli.num_envs is not None:
+        env_cfg.scene.num_envs = args_cli.num_envs
+
+    # Create environment with configuration
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     # Wrap environment for rsl-rl
     env = RslRlVecEnvWrapper(env)
@@ -153,8 +175,8 @@ def main():
 
         # Observation groups
         obs_groups={
-            "privileged": ["policy", "privileged"],  # Teacher sees both
-            "proprioceptive": ["policy"],  # Student sees only policy observations
+            "privileged": ["policy"],  # For EVA02, both use policy obs (no separate privileged obs)
+            "proprioceptive": ["policy"],  # Student sees policy observations with history
         },
 
         # Logging

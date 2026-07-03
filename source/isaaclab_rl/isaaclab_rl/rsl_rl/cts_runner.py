@@ -13,9 +13,8 @@ from collections import deque
 from datetime import datetime
 
 import torch
+from rsl_rl.env import VecEnv
 from tensordict import TensorDict
-
-from isaaclab.envs import VecEnv
 
 from .cts_algorithm import CTS
 from .encoder_model import EncoderModel
@@ -111,18 +110,46 @@ class CTSRunner:
         )
 
         # Create actor (policy network) - shared between teacher and student
-        # Note: Actor input = proprioceptive_obs + latent
-        from .rl_cfg import RslRlMLPModelCfg
+        # Actor input = proprioceptive_obs + latent representation
+        from .cts_networks import CTSActor, CTSCritic
 
-        # This is a placeholder - you need to properly instantiate the actor based on your setup
-        print("[CTS] Actor and Critic network initialization needs to be completed based on rsl_rl structure")
+        actor_cfg = self.cfg.get("actor", {})
+        critic_cfg = self.cfg.get("critic", {})
+
+        # Get dimensions
+        num_actions = self.env.num_actions
+        # Actor receives: proprioceptive_obs + latent
+        obs_proprio_dim = self.proprioceptive_encoder.obs_dim  # Policy obs dimension
+        actor_input_dim = obs_proprio_dim + self.proprioceptive_encoder.latent_dim
+
+        # Create actor network
+        actor_hidden_dims = actor_cfg.get("hidden_dims", [512, 256, 128])
+        actor_activation = actor_cfg.get("activation", "elu")
+        actor_network = CTSActor(
+            input_dim=actor_input_dim,
+            num_actions=num_actions,
+            hidden_dims=actor_hidden_dims,
+            activation=actor_activation,
+        )
+
+        # Create critic network (receives latent only)
+        critic_hidden_dims = critic_cfg.get("hidden_dims", [512, 256, 128])
+        critic_activation = critic_cfg.get("activation", "elu")
+        critic_network = CTSCritic(
+            latent_dim=self.privileged_encoder.latent_dim,
+            hidden_dims=critic_hidden_dims,
+            activation=critic_activation,
+        )
+
+        print(f"[CTS] Actor: input({actor_input_dim}) = proprio({obs_proprio_dim}) + latent({self.proprioceptive_encoder.latent_dim}) -> {actor_hidden_dims} -> actions({num_actions})")
+        print(f"[CTS] Critic: latent({self.privileged_encoder.latent_dim}) -> {critic_hidden_dims} -> value(1)")
 
         # Create CTS algorithm
         self.alg = CTS(
             privileged_encoder=self.privileged_encoder,
             proprioceptive_encoder=self.proprioceptive_encoder,
-            actor=None,  # Placeholder
-            critic=None,  # Placeholder
+            actor=actor_network,
+            critic=critic_network,
             num_learning_epochs=algorithm_cfg.get("num_learning_epochs", 5),
             num_mini_batches=algorithm_cfg.get("num_mini_batches", 4),
             clip_param=algorithm_cfg.get("clip_param", 0.2),
@@ -150,9 +177,10 @@ class CTSRunner:
         # Get initial observations
         obs = self.env.get_observations()
 
-        # Initialize observation history
+        # Initialize observation history for STUDENT environments only
+        initial_student_obs = self._split_obs(obs, self.num_envs_teacher, self.num_envs)
         for _ in range(self.obs_history_buffer.maxlen):
-            self.obs_history_buffer.append(self._get_proprioceptive_obs(obs))
+            self.obs_history_buffer.append(self._get_proprioceptive_obs(initial_student_obs))
 
         start_time = time.time()
 
@@ -162,11 +190,16 @@ class CTSRunner:
             # ===== Rollout Phase =====
             teacher_data, student_data = self._collect_rollouts(obs)
 
+            # Convert to storage objects
+            from .rollout_storage import RolloutStorage
+            teacher_storage = RolloutStorage(teacher_data)
+            student_storage = RolloutStorage(student_data)
+
             # ===== Update Phase =====
             if it % 10 == 0:
                 print(f"[CTS] Iteration {it}/{num_learning_iterations}")
 
-            metrics = self.alg.update(teacher_data, student_data)
+            metrics = self.alg.update(teacher_storage, student_storage)
 
             # ===== Logging =====
             if it % 10 == 0:
@@ -176,10 +209,15 @@ class CTSRunner:
                     print(f"  {key}: {value:.4f}")
 
             # ===== Save checkpoints =====
-            if self.log_dir and it % 100 == 0:
-                self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+            if self.log_dir and self.tot_iterations % 100 == 0:
+                self.save(os.path.join(self.log_dir, f"model_{self.tot_iterations}.pt"))
 
             self.tot_iterations += 1
+
+        # Save final model
+        if self.log_dir:
+            final_path = os.path.join(self.log_dir, f"model_{self.tot_iterations}.pt")
+            self.save(final_path)
 
         total_time = time.time() - start_time
         print(f"[CTS] Training completed in {total_time:.2f} seconds")
@@ -196,44 +234,132 @@ class CTSRunner:
         teacher_data = {"obs": [], "actions": [], "rewards": [], "dones": [], "log_probs": [], "values": []}
         student_data = {"obs": [], "obs_history": [], "actions": [], "rewards": [], "dones": []}
 
-        # Split observations for teacher and student
-        obs_teacher = self._split_obs(obs, 0, self.num_envs_teacher)
-        obs_student = self._split_obs(obs, self.num_envs_teacher, self.num_envs)
+        # Collect rollouts for both teacher and student simultaneously
+        for step in range(max(self.teacher_steps_per_env, self.student_steps_per_env)):
+            # Split observations
+            obs_teacher = self._split_obs(obs, 0, self.num_envs_teacher)
+            obs_student = self._split_obs(obs, self.num_envs_teacher, self.num_envs)
 
-        # Teacher rollout
-        with torch.no_grad():
-            for step in range(self.teacher_steps_per_env):
-                actions, latent = self.alg.act_teacher(obs_teacher)
-                next_obs, rewards, dones, infos = self.env.step(actions)
+            # Generate actions for both teacher and student
+            with torch.no_grad():
+                # Teacher actions
+                if step < self.teacher_steps_per_env:
+                    teacher_actions, teacher_latent = self.alg.act_teacher(obs_teacher)
 
+                    # Compute teacher value
+                    teacher_values = self.alg.critic({"policy": teacher_latent})
+
+                    # Compute teacher log probs (approximate using Gaussian)
+                    teacher_log_probs = self._compute_log_probs(teacher_actions)
+                else:
+                    teacher_actions = torch.zeros(
+                        self.num_envs_teacher, self.env.num_actions, device=self.device
+                    )
+                    teacher_values = None
+                    teacher_log_probs = None
+
+                # Student actions
+                if step < self.student_steps_per_env:
+                    # obs_history already contains only student envs (initialized that way)
+                    obs_history = torch.cat(list(self.obs_history_buffer), dim=-1)
+                    student_actions = self.alg.act_student(obs_student, obs_history)
+                else:
+                    student_actions = torch.zeros(
+                        self.num_envs - self.num_envs_teacher, self.env.num_actions, device=self.device
+                    )
+
+                # Combine actions for all environments
+                all_actions = torch.cat([teacher_actions, student_actions], dim=0)
+
+            # Step environment with all actions
+            next_obs, rewards, dones, infos = self.env.step(all_actions)
+
+            # Split rewards and dones
+            teacher_rewards = rewards[:self.num_envs_teacher]
+            student_rewards = rewards[self.num_envs_teacher:]
+            teacher_dones = dones[:self.num_envs_teacher]
+            student_dones = dones[self.num_envs_teacher:]
+
+            # Store teacher data
+            if step < self.teacher_steps_per_env:
                 teacher_data["obs"].append(obs_teacher)
-                teacher_data["actions"].append(actions)
-                teacher_data["rewards"].append(rewards)
-                teacher_data["dones"].append(dones)
+                teacher_data["actions"].append(teacher_actions)
+                teacher_data["rewards"].append(teacher_rewards)
+                teacher_data["dones"].append(teacher_dones)
+                teacher_data["log_probs"].append(teacher_log_probs)
+                teacher_data["values"].append(teacher_values)
 
-                obs_teacher = next_obs
-
-        # Student rollout
-        with torch.no_grad():
-            for step in range(self.student_steps_per_env):
-                # Get observation history
-                obs_history = torch.cat(list(self.obs_history_buffer), dim=-1)
-
-                actions = self.alg.act_student(obs_student, obs_history)
-                next_obs, rewards, dones, infos = self.env.step(actions)
-
+            # Store student data
+            if step < self.student_steps_per_env:
                 student_data["obs"].append(obs_student)
                 student_data["obs_history"].append(obs_history)
-                student_data["actions"].append(actions)
-                student_data["rewards"].append(rewards)
-                student_data["dones"].append(dones)
+                student_data["actions"].append(student_actions)
+                student_data["rewards"].append(student_rewards)
+                student_data["dones"].append(student_dones)
 
-                # Update history
-                self.obs_history_buffer.append(self._get_proprioceptive_obs(next_obs))
+                # Update history buffer with NEW student observations only
+                next_obs_student = self._split_obs(next_obs, self.num_envs_teacher, self.num_envs)
+                self.obs_history_buffer.append(self._get_proprioceptive_obs(next_obs_student))
 
-                obs_student = next_obs
+            # Update observations
+            obs = next_obs
+
+        # Compute advantages and returns for teacher using GAE
+        teacher_data = self._compute_advantages_returns(teacher_data)
 
         return teacher_data, student_data
+
+    def _compute_log_probs(self, actions: torch.Tensor) -> torch.Tensor:
+        """Compute log probabilities for actions (simplified).
+
+        Args:
+            actions: Action tensor.
+
+        Returns:
+            Log probabilities.
+        """
+        # Simplified: assume unit variance Gaussian, return zeros
+        # In a full implementation, would use the actor's distribution
+        return torch.zeros(actions.shape[0], device=self.device)
+
+    def _compute_advantages_returns(self, data: dict) -> dict:
+        """Compute advantages and returns using GAE.
+
+        Args:
+            data: Dictionary with rewards, values, dones.
+
+        Returns:
+            Updated data dictionary with advantages and returns.
+        """
+        rewards = torch.stack(data["rewards"])  # [T, N]
+        values = torch.stack(data["values"]).squeeze(-1)  # [T, N]
+        dones = torch.stack(data["dones"])  # [T, N]
+
+        T, N = rewards.shape
+        advantages = torch.zeros_like(rewards)
+        returns = torch.zeros_like(rewards)
+
+        # GAE computation
+        gamma = 0.99
+        lam = 0.95
+
+        gae = 0
+        for t in reversed(range(T)):
+            if t == T - 1:
+                next_value = values[t]  # Bootstrap with last value
+            else:
+                next_value = values[t + 1]
+
+            delta = rewards[t] + gamma * next_value * (1 - dones[t].float()) - values[t]
+            gae = delta + gamma * lam * (1 - dones[t].float()) * gae
+            advantages[t] = gae
+            returns[t] = advantages[t] + values[t]
+
+        # Add to data as lists (to match the structure)
+        data["advantages"] = [advantages[i] for i in range(T)]
+        data["returns"] = [returns[i] for i in range(T)]
+
+        return data
 
     def _split_obs(self, obs: TensorDict, start_idx: int, end_idx: int) -> TensorDict:
         """Split observations for a subset of environments.
@@ -278,6 +404,8 @@ class CTSRunner:
             {
                 "privileged_encoder": self.privileged_encoder.state_dict(),
                 "proprioceptive_encoder": self.proprioceptive_encoder.state_dict(),
+                "actor": self.alg.actor.state_dict(),
+                "critic": self.alg.critic.state_dict(),
                 "iteration": self.tot_iterations,
             },
             path,

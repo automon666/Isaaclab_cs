@@ -9,6 +9,12 @@
 This script performs basic tests to verify that the CTS components are correctly implemented.
 """
 
+# Initialize Isaac Sim before importing any other modules
+from isaacsim import SimulationApp
+
+# Create a headless simulation app (required for Isaac Sim imports)
+simulation_app = SimulationApp({"headless": True})
+
 import torch
 from tensordict import TensorDict
 
@@ -26,6 +32,7 @@ try:
     print("✓ All CTS components imported successfully")
 except Exception as e:
     print(f"✗ Import failed: {e}")
+    simulation_app.close()
     exit(1)
 
 
@@ -279,10 +286,14 @@ def main():
 
     if all_passed:
         print("\n🎉 All tests passed! CTS implementation is ready to use.")
-        return 0
+        exit_code = 0
     else:
         print("\n❌ Some tests failed. Please check the implementation.")
-        return 1
+        exit_code = 1
+
+    # Close the simulation app
+    simulation_app.close()
+    return exit_code
 
 
 if __name__ == "__main__":
