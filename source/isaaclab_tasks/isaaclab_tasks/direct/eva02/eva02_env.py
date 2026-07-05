@@ -32,6 +32,9 @@ class EVA02Env(DirectRLEnv):
         self._previous_actions = torch.zeros(
             self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device
         )
+        self._previous_previous_actions = torch.zeros(
+            self.num_envs, gym.spaces.flatdim(self.single_action_space), device=self.device
+        )
 
         # X/Y linear velocity and yaw angular velocity commands
         self._commands = torch.zeros(self.num_envs, 3, device=self.device)
@@ -45,9 +48,15 @@ class EVA02Env(DirectRLEnv):
                 "lin_vel_z_l2",
                 "ang_vel_xy_l2",
                 "dof_torques_l2",
+                "dof_power_l2",
                 "dof_acc_l2",
+                "base_height_l2",
                 "action_rate_l2",
+                "action_smoothness_l2",
+                "feet_regulation",
                 "feet_air_time",
+                "collision",
+                "joint_limit",
                 "undesired_contacts",
                 "flat_orientation_l2",
             ]
@@ -82,6 +91,8 @@ class EVA02Env(DirectRLEnv):
         sky_light_cfg.func("/World/skyLight", sky_light_cfg, translation=(0.0, 0.0, 0.0))
 
     def _pre_physics_step(self, actions: torch.Tensor):
+        self._previous_previous_actions = self._previous_actions.clone()
+        self._previous_actions = self._actions.clone()
         self._actions = actions.clone()
         self._processed_actions = self.cfg.action_scale * self._actions + self._robot.data.default_joint_pos
 
@@ -89,61 +100,110 @@ class EVA02Env(DirectRLEnv):
         self._robot.set_joint_position_target(self._processed_actions)
 
     def _get_observations(self) -> dict:
-        self._previous_actions = self._actions.clone()
+        # Proprioceptive-only observation (48 dims) — deployable on real robot
+        proprio_obs = torch.cat(
+            [
+                self._robot.data.root_lin_vel_b,                                    # 3
+                self._robot.data.root_ang_vel_b,                                     # 3
+                self._robot.data.projected_gravity_b,                                # 3
+                self._commands,                                                      # 3
+                self._robot.data.joint_pos - self._robot.data.default_joint_pos,    # 12
+                self._robot.data.joint_vel,                                          # 12
+                self._actions,                                                       # 12
+            ],
+            dim=-1,
+        )
+
+        # Full policy observation (includes height for rough terrain)
         height_data = None
         if isinstance(self.cfg, EVA02RoughEnvCfg):
             height_data = (
                 self._height_scanner.data.pos_w[:, 2].unsqueeze(1) - self._height_scanner.data.ray_hits_w[..., 2] - 0.5
             ).clip(-1.0, 1.0)
-        obs = torch.cat(
-            [
-                tensor
-                for tensor in (
-                    self._robot.data.root_lin_vel_b,
-                    self._robot.data.root_ang_vel_b,
-                    self._robot.data.projected_gravity_b,
-                    self._commands,
-                    self._robot.data.joint_pos - self._robot.data.default_joint_pos,
-                    self._robot.data.joint_vel,
-                    height_data,
-                    self._actions,
-                )
-                if tensor is not None
-            ],
-            dim=-1,
+
+        policy_obs = torch.cat(
+            [t for t in (proprio_obs, height_data) if t is not None], dim=-1
         )
-        observations = {"policy": obs}
+
+        observations = {
+            "policy": policy_obs,
+            "proprioceptive": proprio_obs,  # Always 48 dims — used by CTS student
+        }
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        # linear velocity tracking
+        # linear velocity tracking: exp(-4 * ||v_cmd - v||^2)  (CTS paper eq.)
         lin_vel_error = torch.sum(torch.square(self._commands[:, :2] - self._robot.data.root_lin_vel_b[:, :2]), dim=1)
-        lin_vel_error_mapped = torch.exp(-lin_vel_error / 0.25)
-        # yaw rate tracking
+        lin_vel_error_mapped = torch.exp(-lin_vel_error / 0.25)  # /0.25 equiv to *4
+
+        # yaw rate tracking: exp(-4 * (ωz_cmd - ωz)^2)
         yaw_rate_error = torch.square(self._commands[:, 2] - self._robot.data.root_ang_vel_b[:, 2])
         yaw_rate_error_mapped = torch.exp(-yaw_rate_error / 0.25)
-        # z velocity penalty
+
+        # z velocity penalty: vz^2
         z_vel_error = torch.square(self._robot.data.root_lin_vel_b[:, 2])
-        # angular velocity x/y penalty
+
+        # angular velocity x/y penalty: ||ω_xy||^2
         ang_vel_error = torch.sum(torch.square(self._robot.data.root_ang_vel_b[:, :2]), dim=1)
-        # joint torques penalty
+
+        # joint torques penalty: ||τ||^2
         joint_torques = torch.sum(torch.square(self._robot.data.applied_torque), dim=1)
-        # joint acceleration penalty
+
+        # joint power penalty: |τ||q̇|^T (CTS paper)
+        joint_power = torch.sum(torch.abs(self._robot.data.applied_torque * self._robot.data.joint_vel), dim=1)
+
+        # joint acceleration penalty: q̈^2
         joint_accel = torch.sum(torch.square(self._robot.data.joint_acc), dim=1)
-        # action rate penalty
+
+        # base height penalty: (h_des - h)^2 (CTS paper)
+        base_height = self._robot.data.root_pos_w[:, 2] - self._terrain.env_origins[:, 2]
+        base_height_error = torch.square(base_height - self.cfg.base_height_target)
+
+        # action rate (1st order): ||a_t - a_{t-1}||^2
         action_rate = torch.sum(torch.square(self._actions - self._previous_actions), dim=1)
+
+        # action smoothness (2nd order): ||a_t - 2a_{t-1} + a_{t-2}||^2 (CTS paper)
+        action_smoothness = torch.sum(
+            torch.square(self._actions - 2.0 * self._previous_actions + self._previous_previous_actions), dim=1
+        )
+
+        # feet regulation reward (CTS paper core innovation):
+        # r_fr = Σ ||v_foot_xy||^2 * exp(-p_foot_z / (0.025 * h_des))
+        foot_velocities = self._robot.data.body_link_lin_vel_w[:, self._feet_ids, :]  # (N, 4, 3)
+        foot_positions = self._robot.data.body_link_pos_w[:, self._feet_ids, :]  # (N, 4, 3)
+        foot_heights = foot_positions[:, :, 2] - self._terrain.env_origins[:, 2].unsqueeze(1)
+        foot_vel_xy_sq = torch.sum(torch.square(foot_velocities[:, :, :2]), dim=-1)  # (N, 4)
+        feet_regulation = torch.sum(
+            foot_vel_xy_sq * torch.exp(-foot_heights / (0.025 * self.cfg.base_height_target)), dim=1
+        )
+
         # feet air time reward
         first_contact = self._contact_sensor.compute_first_contact(self.step_dt)[:, self._feet_ids]
         last_air_time = self._contact_sensor.data.last_air_time[:, self._feet_ids]
         air_time = torch.sum((last_air_time - 0.5) * first_contact, dim=1) * (
             torch.norm(self._commands[:, :2], dim=1) > 0.1
         )
-        # undesired contacts penalty
+
+        # collision penalty: body contact (CTS paper)
         net_contact_forces = self._contact_sensor.data.net_forces_w_history
         is_contact = (
             torch.max(torch.norm(net_contact_forces[:, :, self._undesired_contact_body_ids], dim=-1), dim=1)[0] > 1.0
         )
-        contacts = torch.sum(is_contact, dim=1)
+        collision = torch.sum(is_contact, dim=1)
+
+        # joint limit penalty (CTS paper)
+        joint_pos = self._robot.data.joint_pos
+        joint_limits = self._robot.data.soft_joint_pos_limits
+        lower_limit_violation = torch.relu(joint_limits[:, :, 0] - joint_pos)
+        upper_limit_violation = torch.relu(joint_pos - joint_limits[:, :, 1])
+        joint_limit = torch.sum(lower_limit_violation + upper_limit_violation, dim=1)
+
+        # undesired contacts (thigh/body)
+        is_body_contact = (
+            torch.max(torch.norm(net_contact_forces[:, :, self._undesired_contact_body_ids], dim=-1), dim=1)[0] > 1.0
+        )
+        undesired_contacts = torch.sum(is_body_contact, dim=1)
+
         # flat orientation penalty
         flat_orientation = torch.sum(torch.square(self._robot.data.projected_gravity_b[:, :2]), dim=1)
 
@@ -153,16 +213,23 @@ class EVA02Env(DirectRLEnv):
             "lin_vel_z_l2": z_vel_error * self.cfg.z_vel_reward_scale * self.step_dt,
             "ang_vel_xy_l2": ang_vel_error * self.cfg.ang_vel_reward_scale * self.step_dt,
             "dof_torques_l2": joint_torques * self.cfg.joint_torque_reward_scale * self.step_dt,
+            "dof_power_l2": joint_power * self.cfg.joint_power_reward_scale * self.step_dt,
             "dof_acc_l2": joint_accel * self.cfg.joint_accel_reward_scale * self.step_dt,
+            "base_height_l2": base_height_error * self.cfg.base_height_reward_scale * self.step_dt,
             "action_rate_l2": action_rate * self.cfg.action_rate_reward_scale * self.step_dt,
+            "action_smoothness_l2": action_smoothness * self.cfg.action_smoothness_reward_scale * self.step_dt,
+            "feet_regulation": feet_regulation * self.cfg.feet_regulation_reward_scale * self.step_dt,
             "feet_air_time": air_time * self.cfg.feet_air_time_reward_scale * self.step_dt,
-            "undesired_contacts": contacts * self.cfg.undesired_contact_reward_scale * self.step_dt,
+            "collision": collision * self.cfg.collision_reward_scale * self.step_dt,
+            "joint_limit": joint_limit * self.cfg.joint_limit_reward_scale * self.step_dt,
+            "undesired_contacts": undesired_contacts * self.cfg.undesired_contact_reward_scale * self.step_dt,
             "flat_orientation_l2": flat_orientation * self.cfg.flat_orientation_reward_scale * self.step_dt,
         }
         reward = torch.sum(torch.stack(list(rewards.values())), dim=0)
         # Logging
         for key, value in rewards.items():
-            self._episode_sums[key] += value
+            if key in self._episode_sums:
+                self._episode_sums[key] += value
         return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -181,6 +248,7 @@ class EVA02Env(DirectRLEnv):
             self.episode_length_buf[:] = torch.randint_like(self.episode_length_buf, high=int(self.max_episode_length))
         self._actions[env_ids] = 0.0
         self._previous_actions[env_ids] = 0.0
+        self._previous_previous_actions[env_ids] = 0.0
         # Sample new commands
         self._commands[env_ids] = torch.zeros_like(self._commands[env_ids]).uniform_(-1.0, 1.0)
         # Reset robot state

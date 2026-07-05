@@ -295,6 +295,12 @@ class CTS:
     def _update_student_encoder(self) -> float:
         """Update student encoder using supervised learning (reconstruction loss).
 
+        Iterates over student_storage (which has obs_history), NOT teacher_storage.
+        The privileged encoder runs on the student's full observation (incl. height map
+        from simulation) to produce the target latent z_t.
+        The student encoder runs on the student's proprioceptive history to produce z_s.
+        Reconstruction loss = MSE(z_s, z_t).
+
         Returns:
             Mean reconstruction loss.
         """
@@ -303,19 +309,19 @@ class CTS:
 
         # Training epochs for student encoder
         for epoch in range(self.student_num_learning_epochs):
-            # Use teacher storage for supervision
-            for batch in self.teacher_storage.mini_batch_generator(self.num_mini_batches):
-                obs = batch["obs"]
-                obs_history = batch.get("obs_history")  # Historical observations for student
+            # Iterate over STUDENT storage (which contains obs_history)
+            for batch in self.student_storage.mini_batch_generator(self.num_mini_batches):
+                obs = batch["obs"]  # TensorDict with "policy" (235) and "proprioceptive" (48)
+                obs_history = batch.get("obs_history")  # Historical proprioceptive: [B, 240]
 
                 if obs_history is None:
-                    # If history not available, skip this update
                     continue
 
-                # Forward pass through both encoders
+                # Teacher encoder on privileged observation (no grad)
                 with torch.no_grad():
                     z_privileged = self.privileged_encoder(obs)
 
+                # Student encoder on proprioceptive history
                 z_proprio = self.proprioceptive_encoder(obs_history)
 
                 # Reconstruction loss (MSE between student and teacher latent)

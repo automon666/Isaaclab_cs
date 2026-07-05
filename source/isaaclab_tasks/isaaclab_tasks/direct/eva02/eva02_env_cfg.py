@@ -139,17 +139,25 @@ class EVA02FlatEnvCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/Robot/.*", history_length=3, update_period=0.005, track_air_time=True
     )
 
-    # reward scales
+    # reward scales (following CTS paper reward terms)
     lin_vel_reward_scale = 1.0
     yaw_rate_reward_scale = 0.5
     z_vel_reward_scale = -2.0
     ang_vel_reward_scale = -0.05
     joint_torque_reward_scale = -2.5e-5
+    joint_power_reward_scale = -5.0e-5     # |τ||q̇|^T (CTS paper)
     joint_accel_reward_scale = -2.5e-7
+    base_height_reward_scale = -5.0         # (h_des - h)^2 (CTS paper)
     action_rate_reward_scale = -0.01
+    action_smoothness_reward_scale = -0.01  # 2nd order (CTS paper)
+    feet_regulation_reward_scale = 0.02     # r_fr: encourage foot clearance (CTS paper)
     feet_air_time_reward_scale = 0.5
+    collision_reward_scale = -1.0           # n_collision (CTS paper)
+    joint_limit_reward_scale = -1.0         # n_limitation (CTS paper)
     undesired_contact_reward_scale = -1.0
     flat_orientation_reward_scale = -5.0
+    # desired base height
+    base_height_target = 0.35
 
 
 @configclass

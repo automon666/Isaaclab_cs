@@ -78,7 +78,7 @@ def main():
 
         # Privileged encoder (teacher)
         privileged_encoder=RslRlEncoderCfg(
-            latent_dim=24,
+            latent_dim=32,
             hidden_dims=[512, 256],
             activation="elu",
             obs_normalization=True,
@@ -87,7 +87,7 @@ def main():
 
         # Proprioceptive encoder (student)
         proprioceptive_encoder=RslRlEncoderCfg(
-            latent_dim=24,
+            latent_dim=32,
             hidden_dims=[512, 256],
             activation="elu",
             obs_normalization=True,
@@ -137,10 +137,10 @@ def main():
         teacher_steps_per_env=24,
         student_steps_per_env=24,
 
-        # Observation groups (EVA02 uses policy obs for both)
+        # Observation groups: teacher sees full obs, student sees only 48-dim proprioceptive
         obs_groups={
-            "privileged": ["policy"],
-            "proprioceptive": ["policy"],
+            "privileged": ["policy"],              # Teacher: 235 dims (48 + 187 height)
+            "proprioceptive": ["proprioceptive"],  # Student: 48 dims (deployable on real robot)
         },
 
         # Logging
