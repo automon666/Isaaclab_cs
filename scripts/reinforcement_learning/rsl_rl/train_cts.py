@@ -161,8 +161,8 @@ def main():
             use_clipped_value_loss=True,
 
             # CTS-specific parameters
-            teacher_batch_size=24576,  # 8192 × 3
-            student_batch_size=12288,  # 2048 × 6
+            teacher_batch_size=12288,  # 8192 × 3
+            student_batch_size=6144,  # 2048 × 6
             reconstruction_loss_coef=1.0,
             student_learning_rate=1e-3,
             student_num_learning_epochs=5,

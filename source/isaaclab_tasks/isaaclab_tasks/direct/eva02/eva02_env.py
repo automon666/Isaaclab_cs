@@ -14,6 +14,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sensors import ContactSensor, RayCaster
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 from .eva02_env_cfg import EVA02FlatEnvCfg, EVA02RoughEnvCfg
 
@@ -73,9 +74,12 @@ class EVA02Env(DirectRLEnv):
         # we need to explicitly filter collisions for CPU simulation
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[self.cfg.terrain.prim_path])
-        # add lights
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
-        light_cfg.func("/World/Light", light_cfg)
+        # add lights - DomeLight with HDR sky texture (following unitree_rl_lab pattern)
+        sky_light_cfg = sim_utils.DomeLightCfg(
+            intensity=750.0,
+            texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
+        )
+        sky_light_cfg.func("/World/skyLight", sky_light_cfg, translation=(0.0, 0.0, 0.0))
 
     def _pre_physics_step(self, actions: torch.Tensor):
         self._actions = actions.clone()

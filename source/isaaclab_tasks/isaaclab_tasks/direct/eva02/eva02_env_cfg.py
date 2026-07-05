@@ -3,13 +3,18 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Configuration for the EVA02 quadruped locomotion environment."""
+"""Configuration for the EVA02 quadruped locomotion environment.
+
+Scene setup follows the pattern from unitree_rl_lab:
+- URDF-first robot loading with proper solver iterations
+- DomeLight with HDR sky texture for realistic lighting
+- TerrainImporter with physics material matching ground friction
+"""
 
 import isaaclab.envs.mdp as mdp
 import isaaclab.sim as sim_utils
 import isaaclab.terrains as terrain_gen
-from isaaclab.actuators import ImplicitActuatorCfg
-from isaaclab.assets import ArticulationCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.envs.common import ViewerCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -20,60 +25,16 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG
 from isaaclab.utils import configclass
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
+
+from isaaclab_assets.robots.eva02.eva02 import EVA02_CFG
 
 ##
-# Robot Configuration
+# Robot Configuration (imported from isaaclab_assets)
 ##
-
-EVA02_CFG = ArticulationCfg(
-    spawn=sim_utils.UrdfFileCfg(
-        asset_path="/home/tino66/Isaaclab_cs/assets/eva02/urdf/EVA02_obj_description.urdf", #EVA02_full_obj.urdf
-        fix_base=False,
-        merge_fixed_joints=True,
-        activate_contact_sensors=True,
-        joint_drive=sim_utils.UrdfFileCfg.JointDriveCfg(
-            drive_type="force",
-            target_type="position",
-            gains=sim_utils.UrdfFileCfg.JointDriveCfg.PDGainsCfg(
-                stiffness=0.0,
-                damping=0.0,
-            ),
-        ),
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(
-            disable_gravity=False,
-            retain_accelerations=False,
-            linear_damping=0.0,
-            angular_damping=0.0,
-            max_linear_velocity=1000.0,
-            max_angular_velocity=1000.0,
-            max_depenetration_velocity=1.0,
-        ),
-        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=False,
-            solver_position_iteration_count=4,
-            solver_velocity_iteration_count=1,
-        ),
-    ),
-    init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.42),
-        joint_pos={
-            ".*_hip_joint": 0.0,
-            ".*_thigh_joint": 0.8,
-            ".*_calf_joint": -1.5,
-        },
-        joint_vel={".*": 0.0},
-    ),
-    soft_joint_pos_limit_factor=0.9,
-    actuators={
-        "legs": ImplicitActuatorCfg(
-            joint_names_expr=[".*_hip_joint", ".*_thigh_joint", ".*_calf_joint"],
-            effort_limit=33.5,
-            velocity_limit=21.0,
-            stiffness=25.0,
-            damping=0.5,
-        ),
-    },
-)
+# EVA02_CFG is imported from isaaclab_assets.robots.eva02.eva02
+# It uses UrdfFileCfg with proper solver iterations (8,4),
+# self-collisions enabled, and relative-path URDF for mesh resolution.
 
 
 @configclass
@@ -202,7 +163,7 @@ class EVA02RoughEnvCfg(EVA02FlatEnvCfg):
     terrain = TerrainImporterCfg(
         prim_path="/World/ground",
         terrain_type="generator",
-        terrain_generator=None,  # Will be set from isaaclab.terrains.config.rough
+        terrain_generator=ROUGH_TERRAINS_CFG,
         max_init_terrain_level=9,
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -211,10 +172,7 @@ class EVA02RoughEnvCfg(EVA02FlatEnvCfg):
             static_friction=1.0,
             dynamic_friction=1.0,
         ),
-        visual_material=sim_utils.MdlFileCfg(
-            mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",
-            project_uvw=True,
-        ),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.6, 0.6, 0.6)),
         debug_vis=False,
     )
 
